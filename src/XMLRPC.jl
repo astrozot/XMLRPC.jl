@@ -5,6 +5,8 @@ using HTTP: HTTP
 using Dates
 using Base64: base64decode
 
+export Proxy, XMLRPCException
+
 """
 An XML RPC Proxy wrapper type for the server URL.
 """
@@ -28,6 +30,13 @@ struct Call
     parameters::Tuple
 end
 
+"""
+The exception raised by faulty XMLRPC calls
+"""
+struct XMLRPCException <: Exception
+    code::Int
+    messsage::String
+end
 
 function Base.getindex(proxy::Proxy, s::AbstractString)
     function ret(m...)
@@ -37,7 +46,11 @@ function Base.getindex(proxy::Proxy, s::AbstractString)
             "Content-Type" => "text/xml",
             "User-Agent" => "Julia XML-RPC Client"
         )
-        res = HTTP.post(proxy.url, headers, string(xdoc))
+        res = try
+            HTTP.post(proxy.url, headers, string(xdoc))
+        finally
+            free(xdoc)
+        end
         if res.status!= 200
             error("HTTP error $res.status: $res.body")
         end
@@ -47,6 +60,8 @@ end
 
 
 """
+    xml(x::Call)
+
 Convert a `XMLRPCCall` into XML.
 """
 function xml(x::Call)
@@ -62,6 +77,8 @@ function xml(x::Call)
 end
 
 """
+    rpc_arg(x::XMLElement, stuff)
+
 Convert a value, Dict, or Vector into an XMLRPC snippet.
 """
 function rpc_arg(x::XMLElement, p::Int32)
@@ -74,6 +91,10 @@ end
 
 function rpc_arg(x::XMLElement, p::Bool)
     add_text(new_child(new_child(x, "value"), "boolean"), p ? "1" : "0")
+end
+
+function rpc_arg(x::XMLElement, ::Nothing)
+    add_text(new_child(new_child(x, "value"), "nil"))
 end
 
 function rpc_arg(x::XMLElement, p::Float64)
@@ -91,14 +112,14 @@ end
 # TODO new_child for base64
 
 function rpc_arg(x::XMLElement, p::Vector)
-    d = new_child(new_child(x, "array"), "data")
+    d = new_child(new_child(new_child(x, "value"), "array"), "data")
     for e in p
         rpc_arg(d, e)
     end
 end
 
 function rpc_arg(x::XMLElement, d::Dict)
-    s = new_child(x, "struct")
+    s = new_child(new_child(x, "value"), "struct")
     for p in d
         rpc_arg(s, p)
     end
@@ -111,55 +132,75 @@ function rpc_arg(x::XMLElement, p::Pair)
     rpc_arg(m, p.second)
 end
 
+"""
+    xmlrpc_parse(element)
+
+Parse `element` into a Julia object.
+
+`element` can be a string or an `XMLElement`.
+"""
 function xmlrpc_parse(s::AbstractString)
     x = LightXML.parse_string(s)
-    xroot = root(x)
-    name(xroot) == "methodResponse" || error("malformed XMLRPC response")
-    xmlrpc_parse(collect(child_elements(xroot))[1])
+    try
+        xroot = root(x)
+        name(xroot) == "methodResponse" || error("malformed XMLRPC response")
+        xmlrpc_parse(collect(child_elements(xroot))[1])
+    finally
+        free(x)
+    end
 end
 
 function xmlrpc_parse(x::XMLElement)
-    if name(x) == "value"
-        c = collect(child_elements(x))[1]
-        if name(c) == "i4" || name(c) == "int"
-            return parse(Int32, content(c))
-        elseif name(c) == "dateTime.iso8601"
-            return DateTime(content(c))
-        elseif name(c) == "boolean"
-            return content(c) == "true" || content(c) == "1"
-        elseif name(c) == "double"
-            return parse(Float64, content(c))
-        elseif name(c) == "base64"
-            return base64decode(content(c))
-        elseif name(c) == "string"
-            return content(c)
-        elseif name(c) == "array"
-            c = collect(child_elements(c))[1] # <data>
+    name_x = name(x)
+    if name_x == "value"
+        children = collect(child_elements(x))
+        if length(children) == 0 # special case in case of malformed node: interpret as string
+            return content(x)
+        end
+        child1 = children[1]
+        name_child1 = name(child1)
+        if name_child1 == "i4" || name_child1 == "int"
+            return parse(Int32, content(child1))
+        elseif name_child1 == "i8"
+            return parse(Int64, content(child1))
+        elseif name_child1 == "dateTime.iso8601"
+            return DateTime(content(child1))
+        elseif name_child1 == "boolean"
+            return content(child1) == "true" || content(child1) == "1"
+        elseif name_child1 == "nil"
+            return nothing
+        elseif name_child1 == "double"
+            return parse(Float64, content(child1))
+        elseif name_child1 == "base64"
+            return base64decode(content(child1))
+        elseif name_child1 == "string"
+            return content(child1)
+        elseif name_child1 == "array"
+            c′ = collect(child_elements(child1))[1] # <data>
             arr = []
-            for elt in child_elements(c)
+            for elt in child_elements(c′)
                 push!(arr, xmlrpc_parse(elt))
             end
             return arr
-        elseif name(c) == "struct"
+        elseif name_child1 == "struct"
             d = Dict()
-            for elt in child_elements(c)
+            for elt in child_elements(child1)
                 push!(d, xmlrpc_parse(elt))
             end
             return d
         end
-    elseif name(x) == "member"
-        c = collect(child_elements(x))
-        n = content(c[1]) # name
-        v = xmlrpc_parse(c[2]) # value
+    elseif name_x == "member"
+        c″ = collect(child_elements(x))
+        n = content(c″[1]) # name
+        v = xmlrpc_parse(c″[2]) # value
         return Pair(n,v)
-    elseif name(x) == "params" || name(x) == "param" # always one param on return
+    elseif name_x == "params" || name_x == "param" # always one param on return
         return xmlrpc_parse(collect(child_elements(x))[1])
-    elseif name(x) == "fault"
-        error("XMLRPC Fault:\n$x")
+    elseif name_x == "fault"
+        c‴ = collect(child_elements(x))[1]
+        fault = xmlrpc_parse(c‴)
+        throw(XMLRPCException(fault["faultCode"], fault["faultString"]))
     end
 end
-
-
-
 
 end # module
